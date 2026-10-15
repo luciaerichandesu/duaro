@@ -35,6 +35,7 @@ from camera import (
     load_bin_coordinates,
     save_bin_coordinates,
     BIN_COORDINATES_FILE,
+    draw_text_jp,
 )
 from duaro_yolo_detector import (
     WasteDetector,
@@ -438,8 +439,8 @@ def auto_sorting_loop(sock, cap, detector, bin_coords, h_matrix, table_z, window
         if target:
             cat = target["category"]
             box_name = CATEGORY_TO_BIN.get(cat, "未設定")
-            cv2.putText(display_frame, f"Next: {cat} -> [{box_name}]", (20, 70),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            draw_text_jp(display_frame, f"Next: {cat} -> [{box_name}]", (20, 65),
+                         font_size=18, color=(0, 255, 0))
         else:
             cv2.putText(display_frame, "Scanning for waste...", (20, 70),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128, 128, 128), 2)
@@ -602,8 +603,8 @@ if __name__ == "__main__":
                     f"TARGET: {cat} -> [{box_name}] "
                     f"(conf:{conf:.2f}, X={rx:.0f}, Y={ry:.0f})"
                 )
-                cv2.putText(display_frame, guide, (20, 40),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                draw_text_jp(display_frame, guide, (20, 20),
+                             font_size=18, color=(0, 255, 0))
                 cv2.putText(display_frame, "'s': Sort 1 / 'a': Auto-sort all", (20, 70),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
             else:
@@ -613,10 +614,10 @@ if __name__ == "__main__":
             cv2.imshow(window_name, display_frame)
             key = cv2.waitKey(20) & 0xFF
 
-            if key == ord("q"):
+            if key in (ord("q"), ord("Q"), 27):
                 break
 
-            elif key == ord("s"):
+            elif key in (ord("s"), ord("S")):
                 if target is None:
                     print("[WARN] 分別対象の物体が検出されていません")
                     continue
@@ -630,7 +631,7 @@ if __name__ == "__main__":
 
                 execute_sorting(sock, target, bin_coords, H_matrix, table_z)
 
-            elif key == ord("a"):
+            elif key in (ord("a"), ord("A")):
                 auto_sorting_loop(sock, cap, detector, bin_coords, H_matrix, table_z, window_name)
 
     except KeyboardInterrupt:

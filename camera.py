@@ -28,6 +28,73 @@ import os
 import cv2
 import numpy as np
 
+# 日本語テキスト描画用（Pillow）
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
+
+_FONT_CACHE = {}
+
+
+def get_jp_font(font_size=18):
+    """Windowsの日本語フォントを取得（キャッシュ付き）"""
+    if font_size in _FONT_CACHE:
+        return _FONT_CACHE[font_size]
+    font_paths = [
+        "C:\\Windows\\Fonts\\meiryo.ttc",
+        "C:\\Windows\\Fonts\\msgothic.ttc",
+        "C:\\Windows\\Fonts\\YuGothM.ttc",
+    ]
+    for path in font_paths:
+        if os.path.exists(path):
+            try:
+                font = ImageFont.truetype(path, font_size)
+                _FONT_CACHE[font_size] = font
+                return font
+            except Exception:
+                continue
+    try:
+        font = ImageFont.load_default()
+        _FONT_CACHE[font_size] = font
+        return font
+    except Exception:
+        return None
+
+
+def draw_text_jp(img, text, pos, font_size=18, color=(0, 255, 0)):
+    """
+    OpenCV画像(BGR)に日本語テキストを描画する。
+    pos: (x, y) 左上座標
+    font_size: フォントサイズ (pt)
+    color: BGR形式のタプル
+    """
+    if not _PIL_AVAILABLE:
+        cv2.putText(img, text, (pos[0], pos[1] + font_size),
+                    cv2.FONT_HERSHEY_SIMPLEX, font_size / 30.0, color, 2)
+        return img
+
+    font = get_jp_font(font_size)
+    if font is None:
+        cv2.putText(img, text, (pos[0], pos[1] + font_size),
+                    cv2.FONT_HERSHEY_SIMPLEX, font_size / 30.0, color, 2)
+        return img
+
+    try:
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(img_rgb)
+        draw = ImageDraw.Draw(pil_img)
+        color_rgb = (color[2], color[1], color[0]) if len(color) >= 3 else color
+        draw.text(pos, text, font=font, fill=color_rgb)
+        res = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+        img[:] = res
+    except Exception:
+        cv2.putText(img, text, (pos[0], pos[1] + font_size),
+                    cv2.FONT_HERSHEY_SIMPLEX, font_size / 30.0, color, 2)
+    return img
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 定数
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -99,24 +166,24 @@ def pick_corners_from_camera(camera_index=1):
             # クリック済みの点と番号を描画
             for i, (px, py) in enumerate(clicked_points):
                 cv2.circle(frame, (px, py), 6, (0, 0, 255), -1)
-                cv2.putText(
-                    frame, f"{i + 1}:{CORNER_LABELS[i]}", (px + 8, py - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2,
+                draw_text_jp(
+                    frame, f"{i + 1}:{CORNER_LABELS[i]}", (px + 8, max(py - 20, 0)),
+                    font_size=16, color=(0, 0, 255),
                 )
 
             cv2.imshow(window_name, frame)
             key = cv2.waitKey(20) & 0xFF
 
-            if key == ord("r"):
+            if key in (ord("r"), ord("R")):
                 clicked_points.clear()
                 print("[INFO] クリックをリセットしました")
-            elif key == ord("q"):
+            elif key in (ord("q"), ord("Q"), 27):
                 raise KeyboardInterrupt("ユーザーによる中断")
 
             if len(clicked_points) == 4:
                 print("[INFO] 4点クリックされました。何かキーを押すと確定します（'r'でやり直し）")
                 key2 = cv2.waitKey(0) & 0xFF
-                if key2 == ord("r"):
+                if key2 in (ord("r"), ord("R")):
                     clicked_points.clear()
                     print("[INFO] クリックをリセットしました")
                     continue
@@ -301,14 +368,14 @@ def detect_bins_from_camera(camera_index=1, homography_matrix=None):
                     else:
                         label = f"{bin_name}: px({center[0]},{center[1]})"
 
-                    cv2.putText(display, f"OK {label}", (10, status_y),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                    draw_text_jp(display, f"OK {label}", (10, status_y),
+                                 font_size=18, color=color)
                 else:
-                    cv2.putText(display, f"NG {bin_name}: 未検出", (10, status_y),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                    draw_text_jp(display, f"NG {bin_name}: 未検出", (10, status_y),
+                                 font_size=18, color=(0, 0, 255))
                     all_found = False
 
-                status_y += 25
+                status_y += 28
 
             # 全箱検出済みなら緑で案内表示
             if all_found:
@@ -319,10 +386,17 @@ def detect_bins_from_camera(camera_index=1, homography_matrix=None):
             cv2.imshow(window_name, display)
             key = cv2.waitKey(30) & 0xFF
 
-            if key == ord("q"):
+            # 'q', 'Q', または ESCキーで中断
+            if key in (ord("q"), ord("Q"), 27):
                 raise KeyboardInterrupt("ユーザーによる中断")
 
-            elif key == ord("s"):
+            # 'r', 'R' で再検出
+            elif key in (ord("r"), ord("R")):
+                print("[INFO] 再検出中...（箱の位置や向きを調整してください）")
+                continue
+
+            # 's', 'S', Enter(13), Space(32) で確定保存
+            elif key in (ord("s"), ord("S"), 13, 32):
                 # 現在の検出結果を確定
                 detected_bins = {}
                 missing = []
