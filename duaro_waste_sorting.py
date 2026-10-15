@@ -4,17 +4,17 @@ duaro_waste_sorting.py (メインプログラム: ゴミ自動分別・ピッキ
 処理の流れ:
 1. camera_calibration.json を読み込み (ホモグラフィ行列)
 2. duAroに接続・モータON
-3. カメラでゴミ箱（白・黄・黒）を自動検出し、ロボット座標を取得
+3. カメラでゴミ箱（赤・黄・青）を自動検出し、ロボット座標を取得
 4. カメラでゴミを検出し、カテゴリ（紙/プラ/缶ビン）を判定
 5. キー操作 ('s'キー) で自動分別シーケンスを実行:
      [掴む] 物体上空 -> 下降 -> 掴む -> 上昇
-     [運ぶ] 対応する箱(白/黒/黄)の上空へ移動
+     [運ぶ] 対応する箱(赤/黄/青)の上空へ移動
      [捨てる] 箱の中でハンドを開いて投下 -> 上昇 -> 待機位置へ復帰
 
 事前準備:
     - camera.py の Mode 1 でホモグラフィキャリブレーション済みであること
     - duAro側に goto1 プログラムが登録済みであること
-    - 白・黄・黒のゴミ箱がカメラの視野内に置いてあること
+    - 赤・黄・青のゴミ箱がカメラの視野内に置いてあること
 
 必要ライブラリ:
     pip install opencv-python numpy ultralytics
@@ -88,9 +88,9 @@ AUTO_MAX_FAILURES = 3       # 連続失敗がこの値に達したら自動停�
 # 3. 分別マッピング
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CATEGORY_TO_BIN = {
-    CATEGORY_PAPER:      "白の箱",   # 紙ごみ   -> 白の箱
+    CATEGORY_PAPER:      "青の箱",   # 紙ごみ       -> 青の箱
     CATEGORY_PLASTIC:    "黄の箱",   # プラスチック -> 黄の箱
-    CATEGORY_CAN_BOTTLE: "黒の箱",   # 缶ビン   -> 黒の箱
+    CATEGORY_CAN_BOTTLE: "赤の箱",   # 缶ビン       -> 赤の箱
 }
 
 
@@ -259,13 +259,13 @@ def gripper_control(sock, grasp=True):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def auto_detect_bins(cap, h_matrix):
     """
-    カメラ映像から白・黄・黒のゴミ箱を色で自動検出し、
+    カメラ映像から赤・黄・青のゴミ箱を色で自動検出し、
     ロボット座標 (X, Y) を返す。
 
     複数フレームの検出結果を平均化してノイズを低減する。
     """
     print("\n[INFO] ゴミ箱を自動検出しています...")
-    print("[INFO] 白・黄・黒のゴミ箱がカメラに映っていることを確認してください")
+    print("[INFO] 赤・黄・青のゴミ箱がカメラに映っていることを確認してください")
 
     # カメラの露出が安定するまで読み飛ばす
     for _ in range(30):
@@ -273,7 +273,7 @@ def auto_detect_bins(cap, h_matrix):
 
     # 複数フレームで検出し、中央値を取る（安定化）
     NUM_SAMPLES = 10
-    samples = {name: [] for name in ["白の箱", "黄の箱", "黒の箱"]}
+    samples = {name: [] for name in ["赤の箱", "黄の箱", "青の箱"]}
 
     for i in range(NUM_SAMPLES):
         ret, frame = cap.read()
@@ -321,7 +321,7 @@ def execute_sorting(sock, target_info, bin_coords, h_matrix, table_z):
 
     sock        : duAroソケット
     target_info : WasteDetector.detect() の戻り値
-    bin_coords  : {"白の箱": {"x":..., "y":..., "z_drop":..., "z_safe":...}, ...}
+    bin_coords  : {"赤の箱": {"x":..., "y":..., "z_drop":..., "z_safe":...}, ...}
     h_matrix    : ホモグラフィ行列
     table_z     : 机のZ座標 (mm)
     """
@@ -520,7 +520,7 @@ if __name__ == "__main__":
 
     if not bin_coords:
         print("[ERROR] ゴミ箱が1つも検出できませんでした")
-        print("[INFO] カメラに白・黄・黒の箱が映るように配置してから再実行してください")
+        print("[INFO] カメラに赤・黄・青の箱が映るように配置してから再実行してください")
         cap.release()
         raise SystemExit(1)
 

@@ -9,7 +9,7 @@ Mode 1: ホモグラフィキャリブレーション
 
 Mode 2: ゴミ箱自動検出
     キャリブレーション済みのホモグラフィ行列を使い、
-    カメラ映像から白・黄・黒のゴミ箱を色で自動検出して
+    カメラ映像から赤・黄・青のゴミ箱を色で自動検出して
     ロボット座標に変換し bin_coordinates.json に保存する。
 
 事前準備 (Mode 1):
@@ -36,22 +36,27 @@ BIN_COORDINATES_FILE = "bin_coordinates.json"
 CORNER_LABELS = ["左上", "右上", "右下", "左下"]
 
 # ゴミ箱の色検出パラメータ (HSV)
-# ※ 照明環境に応じて lower / upper を調整してください
+# ※ 赤はHが0度/180度付近の2領域に跨がるため ranges リストで指定
+# ※ 照明環境に応じて範囲を調整してください
 BIN_COLOR_RANGES = {
-    "白の箱": {
-        "lower": np.array([0, 0, 180]),
-        "upper": np.array([180, 60, 255]),
-        "display_bgr": (255, 255, 255),
+    "赤の箱": {
+        "ranges": [
+            (np.array([0, 70, 50]), np.array([10, 255, 255])),
+            (np.array([170, 70, 50]), np.array([180, 255, 255])),
+        ],
+        "display_bgr": (0, 0, 255),
     },
     "黄の箱": {
-        "lower": np.array([18, 70, 70]),
-        "upper": np.array([40, 255, 255]),
+        "ranges": [
+            (np.array([18, 70, 70]), np.array([40, 255, 255])),
+        ],
         "display_bgr": (0, 255, 255),
     },
-    "黒の箱": {
-        "lower": np.array([0, 0, 0]),
-        "upper": np.array([180, 120, 50]),
-        "display_bgr": (80, 80, 80),
+    "青の箱": {
+        "ranges": [
+            (np.array([100, 70, 50]), np.array([130, 255, 255])),
+        ],
+        "display_bgr": (255, 0, 0),
     },
 }
 
@@ -188,13 +193,13 @@ def pixel_to_robot_xy(px, py, homography_matrix):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def detect_bins_in_frame(frame):
     """
-    1フレームから白・黄・黒の箱を HSV 色検出で見つけ、
+    1フレームから赤・黄・青の箱を HSV 色検出で見つけ、
     各箱の中心ピクセル座標を返す。
 
     戻り値:
-        dict: {"白の箱": (cx, cy), "黄の箱": (cx, cy), "黒の箱": (cx, cy)}
+        dict: {"赤の箱": (cx, cy), "黄の箱": (cx, cy), "青の箱": (cx, cy)}
               検出できなかった箱の値は None
-        dict: {"白の箱": contour, ...} — 描画用の輪郭
+        dict: {"赤の箱": contour, ...} — 描画用の輪郭
     """
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     hsv = cv2.GaussianBlur(hsv, (5, 5), 0)
@@ -205,7 +210,14 @@ def detect_bins_in_frame(frame):
     contours_map = {}
 
     for bin_name, cfg in BIN_COLOR_RANGES.items():
-        mask = cv2.inRange(hsv, cfg["lower"], cfg["upper"])
+        if "ranges" in cfg:
+            mask = None
+            for lower, upper in cfg["ranges"]:
+                m = cv2.inRange(hsv, lower, upper)
+                mask = m if mask is None else cv2.bitwise_or(mask, m)
+        else:
+            mask = cv2.inRange(hsv, cfg["lower"], cfg["upper"])
+
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
@@ -242,7 +254,7 @@ def detect_bins_from_camera(camera_index=1, homography_matrix=None):
     対話的に確認・やり直しが可能。
 
     戻り値:
-        dict: {"白の箱": {"x": ..., "y": ...}, ...}
+        dict: {"赤の箱": {"x": ..., "y": ...}, ...}
     """
     cap = cv2.VideoCapture(camera_index)
     if not cap.isOpened():
@@ -256,7 +268,7 @@ def detect_bins_from_camera(camera_index=1, homography_matrix=None):
     cv2.namedWindow(window_name)
 
     print("\n[INFO] ゴミ箱の自動検出中...")
-    print("[INFO] 白・黄・黒の箱がカメラに映るように配置してください")
+    print("[INFO] 赤・黄・青の箱がカメラに映るように配置してください")
     print("[INFO] 's' で確定保存 / 'r' で再検出 / 'q' で中断")
 
     detected_bins = {}
@@ -405,7 +417,7 @@ if __name__ == "__main__":
     camera_index = int(camera_index) if camera_index else 1
 
     print("\n  1. ホモグラフィキャリブレーション（机の四隅）")
-    print("  2. ゴミ箱の自動検出（白・黄・黒の箱）")
+    print("  2. ゴミ箱の自動検出（赤・黄・青の箱）")
     print("  3. 両方実行（1 → 2 の順）")
     print("  q. 終了")
     choice = input("\n選択: ").strip()
