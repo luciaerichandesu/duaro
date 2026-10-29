@@ -1,20 +1,24 @@
 """
-duaro_waste_sorting.py (メインプログラム: ゴミ自動分別・ピッキング制御)
+duaro_waste_sorting.py (メインプログラム: ゴミ自動分別・ピッキング制御 / 双腕対応)
 
 処理の流れ:
-1. camera_calibration.json を読み込み (ホモグラフィ行列)
-2. duAroに接続・モータON
-3. カメラでゴミ箱（赤・黄・青）を自動検出し、ロボット座標を取得
+1. camera_calibration.json を読み込み (アームごとのホモグラフィ行列・左右の境界)
+2. duAroに接続・モータON (アーム1・アーム2 両方)
+3. カメラでゴミ箱（赤・黄・青）を自動検出し、各アームから見たロボット座標を取得
 4. カメラでゴミを検出し、カテゴリ（紙/プラ/缶ビン）を判定
-5. キー操作 ('s'キー) で自動分別シーケンスを実行:
+5. 物体の位置でアームを選ぶ:
+     画面の右側 -> アーム1 (下に付いている右腕)
+     画面の左側 -> アーム2 (上に付いている左腕)
+6. キー操作 ('s'キー) で自動分別シーケンスを実行:
      [掴む] 物体上空 -> 下降 -> 掴む -> 上昇
-     [運ぶ] 対応する箱(赤/黄/青)の上空へ移動
+     [運ぶ] 対応する箱(赤/黄/青)の上空へ移動 (箱は中央に置く前提)
      [捨てる] 箱の中でハンドを開いて投下 -> 上昇 -> 待機位置へ復帰
+   ※ 衝突防止のため、動かすアームは常に1本だけ。もう片方は待機位置で待つ。
 
 事前準備:
-    - camera.py の Mode 1 でホモグラフィキャリブレーション済みであること
-    - duAro側に goto1 プログラムが登録済みであること
-    - 赤・黄・青のゴミ箱がカメラの視野内に置いてあること
+    - camera.py の Mode 1 で双腕6点キャリブレーション済みであること
+    - duAro側に goto1 / pump_on / pump_off プログラムが登録済みであること
+    - 赤・黄・青のゴミ箱がカメラの視野内 (中央) に置いてあること
 
 必要ライブラリ:
     pip install opencv-python numpy ultralytics
@@ -24,18 +28,58 @@ import re
 import socket
 import time
 
+try:
+    import msvcrt
+    _MSVCRT_AVAILABLE = True
+except ImportError:
+    _MSVCRT_AVAILABLE = False
+
 import cv2
 import numpy as np
+
+
+def get_pressed_key(wait_ms=20):
+    """
+    OpenCVウィンドウのキー入力とターミナル（コンソール）のキー入力を両方受け付ける。
+    全角文字（'ｓ','ａ','ｑ'）や半角文字（'s','a','q'）、大文字・ESCキーも統一判定。
+    """
+    key = cv2.waitKey(wait_ms) & 0xFF
+
+    # 1. ターミナル側でキーが押されている場合 (msvcrt)
+    if _MSVCRT_AVAILABLE and msvcrt.kbhit():
+        try:
+            char = msvcrt.getwch().lower()
+            if char in ("s", "ｓ"):
+                return ord("s")
+            elif char in ("a", "ａ"):
+                return ord("a")
+            elif char in ("q", "ｑ", "\x1b"):
+                return ord("q")
+        except Exception:
+            pass
+
+    # 2. OpenCV ウィンドウ側でのキー判定
+    if key in (ord("s"), ord("S")):
+        return ord("s")
+    elif key in (ord("a"), ord("A")):
+        return ord("a")
+    elif key in (ord("q"), ord("Q"), 27):
+        return ord("q")
+
+    return key
 
 # --- 自作モジュール ---
 from camera import (
     load_calibration,
-    pixel_to_robot_xy,
     detect_bins_in_frame,
-    load_bin_coordinates,
+    make_bin_entry,
     save_bin_coordinates,
-    BIN_COORDINATES_FILE,
     draw_text_jp,
+    draw_split_line,
+    open_camera,
+    ARM_RIGHT,
+    ARM_LEFT,
+    ARM_NAMES,
 )
 from duaro_yolo_detector import (
     WasteDetector,
@@ -51,31 +95,53 @@ from air import pump_on, pump_off
 ROBOT_IP = "192.168.0.2"
 ROBOT_PORT = 23
 TIMEOUT = 10
-ARM = 1
-POSE_NAME = "p1"
-PROGRAM_NAME = "goto1"
+ARMS = (ARM_RIGHT, ARM_LEFT)   # 1: 右腕(下) / 2: 左腕(上)
 
-# ハンド開閉用のASプログラム名 (air.py の pump_on / pump_off を使用)
-PUMP_ON_PROGRAM = "pump_on"
-PUMP_OFF_PROGRAM = "pump_off"
+# アームごとの ASプログラム名・ポーズ変数名
+#   移動  : POINT {arm}: {pose} = TRANS(...) → EXECUTE {arm}:{goto}
+#   ハンド: EXECUTE {arm}:{pump_on} / {pump_off}  (air.py の pump_on / pump_off を使用)
+# ※ アーム2で動かない場合は、ここの名前をコントローラー側に合わせて変えるだけでOK
+ARM_PROGRAMS = {
+    ARM_RIGHT: {"pose": "p1", "goto": "goto1", "pump_on": "pump_on", "pump_off": "pump_off"},
+    ARM_LEFT:  {"pose": "p1", "goto": "goto1", "pump_on": "pump_on", "pump_off": "pump_off"},
+}
 
 # カメラ番号 (環境に合わせて変更)
 CAMERA_INDEX = 1
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 2. 高さ設定 (単位: mm)
+# 2. 高さ設定 (単位: mm / アームごと)
+# ・平面的(X, Y)移動時: Z = 430.0 mm で完全固定（絶対に机や箱にぶつからない安全上空）
+# ・机の表面限界: Z = 294.0 mm（これより下へは絶対に下げない衝突防止ライン）
+# ※ 上アームと下アームで取り付け高さが違い、机のZが異なる場合はアームごとに値を変える。
+#    camera.py の Mode 1 で表示される「目印に合わせた時の先端Z」を参考にすること。
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# ピック時の高さ（机面からのオフセット）
-Z_APPROACH_OFFSET = 60.0  # 物体の上空待機高さ (机 + 60mm)
-Z_GRASP_OFFSET = 15.0     # 掴む高さ (机 + 15mm、ワークの厚みに合わせて調整)
+ARM_Z = {
+    ARM_RIGHT: {
+        "table_limit": 294.0,   # 机の表面限界 (mm) ※これより下(小さい数値)には下げない
+        "transit": 430.0,       # ものを持って移動・上空移動する時の固定Z座標 (mm)
+        "grasp": 298.0,         # 物体を掴む高さ (mm) ※机面294mmより4mm手前の安全位置
+        "bin_drop": 430.0,      # 投下高さ (430mm固定: 箱にも絶対にぶつからない安全投下)
+    },
+    ARM_LEFT: {
+        "table_limit": 294.0,
+        "transit": 430.0,
+        "grasp": 298.0,
+        "bin_drop": 430.0,
+    },
+}
 
-# ゴミ箱のZ座標（手動で計測して設定。カメラでは高さ方向を測れないため）
-BIN_Z_DROP = 180.0   # 箱の中でゴミを離す高さ (mm)
-BIN_Z_SAFE = 280.0   # 箱の上空安全高さ (mm)
+# 待機・ホーム位置 (安全上空 430mm / アームごと)
+# ※ アーム2は座標系が鏡像 (同じ姿勢で X の符号が逆) のため X を反転している。
+#    初回は低速で動かして、待機位置が適切か必ず確認すること。
+HOME_POS = {
+    ARM_RIGHT: {"x": 250.0, "y": 0.0, "z": 430.0},
+    ARM_LEFT:  {"x": -250.0, "y": 0.0, "z": 430.0},
+}
 
-# 待機・ホーム位置 (カメラの視野を遮らない安全な位置)
-HOME_POS = {"x": 250.0, "y": 0.0, "z": 300.0}
+# 校正した範囲の外にある物体はスキップする (ホモグラフィの外挿は誤差が大きく危険なため)
+REACH_CHECK = True
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 全自動モードの設定
@@ -188,7 +254,7 @@ def wait_for_completion(sock, max_wait=30):
     return False
 
 
-def motor_on(sock, arm=ARM):
+def motor_on(sock, arm):
     """モータ電源をONにする"""
     print(f"[INFO] モータ電源ON: ZPOWER {arm}: ON")
     resp = send_cmd(sock, f"ZPOWER {arm}: ON", wait=1.0)
@@ -196,13 +262,14 @@ def motor_on(sock, arm=ARM):
     return resp
 
 
-def set_point(sock, x, y, z, o=0.0, a=0.0, t=0.0):
+def set_point(sock, arm, x, y, z, o=0.0, a=0.0, t=0.0):
     """
     POINT指令 + TRANS関数で座標を設定する。
     「変更？」プロンプトに空Enter で確定。
     """
+    pose = ARM_PROGRAMS[arm]["pose"]
     cmd = (
-        f"POINT {ARM}: {POSE_NAME} = "
+        f"POINT {arm}: {pose} = "
         f"TRANS({x:.2f},{y:.2f},{z:.2f},{o:.2f},{a:.2f},{t:.2f})"
     )
     resp1 = send_cmd(sock, cmd, wait=0.5)
@@ -225,16 +292,23 @@ def set_point(sock, x, y, z, o=0.0, a=0.0, t=0.0):
     return resp1
 
 
-def move_to_xyz(sock, x, y, z):
-    """指定座標 (x, y, z) へ移動して完了を待つ"""
-    print(f"[INFO] 移動: X={x:.1f}, Y={y:.1f}, Z={z:.1f}")
-    set_point(sock, x, y, z)
+def move_to_xyz(sock, arm, x, y, z):
+    """アーム arm を指定座標 (x, y, z) へ移動して完了を待つ"""
+    # 【絶対安全ガード】机面以下への下降を阻止するリミッター (アームごと)
+    limit = ARM_Z[arm]["table_limit"]
+    if z < limit:
+        print(f"[SAFETY GUARD] 指令Z={z:.1f} は机面({limit}mm)より下のため、安全限界 Z={limit:.1f} に自動制限しました！")
+        z = limit
+
+    print(f"[INFO] {ARM_NAMES[arm]} 移動: X={x:.1f}, Y={y:.1f}, Z={z:.1f}")
+    set_point(sock, arm, x, y, z)
 
     # EXECUTE でプログラム実行
+    goto = ARM_PROGRAMS[arm]["goto"]
     try:
         flush_buffer(sock)
         sock.settimeout(2.0)
-        sock.sendall(f"EXECUTE {ARM}:{PROGRAM_NAME}\r\n".encode("shift_jis"))
+        sock.sendall(f"EXECUTE {arm}:{goto}\r\n".encode("shift_jis"))
     except Exception as e:
         print(f"[ERROR] EXECUTE 送信エラー: {e}")
         return False
@@ -242,28 +316,65 @@ def move_to_xyz(sock, x, y, z):
     return wait_for_completion(sock)
 
 
-def gripper_control(sock, grasp=True):
+def gripper_control(sock, arm, grasp=True):
     """ハンドの開閉（空気ポンプ: pump_on / pump_off）"""
+    progs = ARM_PROGRAMS[arm]
     if grasp:
-        print("[INFO] ハンド閉じる(掴む): pump_on")
-        success, _ = pump_on(sock, arm=ARM, program_name=PUMP_ON_PROGRAM)
+        print(f"[INFO] {ARM_NAMES[arm]} ハンド閉じる(掴む): {progs['pump_on']}")
+        success, _ = pump_on(sock, arm=arm, program_name=progs["pump_on"])
     else:
-        print("[INFO] ハンド開く(離す): pump_off")
-        success, _ = pump_off(sock, arm=ARM, program_name=PUMP_OFF_PROGRAM)
+        print(f"[INFO] {ARM_NAMES[arm]} ハンド開く(離す): {progs['pump_off']}")
+        success, _ = pump_off(sock, arm=arm, program_name=progs["pump_off"])
     if not success:
         print("[WARN] ハンド開閉コマンドの完了確認に失敗しました")
     return success
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 4.5. 双腕の待機管理 (動かすアームは常に1本だけ)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def go_home(sock, arm, arm_state):
+    """アームを待機位置 (安全上空 Z=430) へ移動する"""
+    home = HOME_POS[arm]
+    print(f">> {ARM_NAMES[arm]} を待機位置へ (Z={home['z']:.1f})")
+    ok = move_to_xyz(sock, arm, home["x"], home["y"], home["z"])
+    arm_state[arm] = ok
+    return ok
+
+
+def ensure_other_arm_home(sock, arm, arm_state):
+    """これから arm を動かす前に、もう片方のアームが待機位置にいることを保証する"""
+    other = ARM_LEFT if arm == ARM_RIGHT else ARM_RIGHT
+    if arm_state.get(other):
+        return True
+    print(f"[INFO] 衝突防止: 先に {ARM_NAMES[other]} を待機位置へ退避させます")
+    if not go_home(sock, other, arm_state):
+        print(f"[ERROR] {ARM_NAMES[other]} の退避に失敗したため、{ARM_NAMES[arm]} は動かしません")
+        return False
+    return True
+
+
+def choose_arm(calib, px, py):
+    """
+    物体のピクセル位置から担当アームを決める。
+    戻り値: (arm, rx, ry, reachable)
+    """
+    arm = calib.arm_for_pixel(px)
+    rx, ry = calib.pixel_to_robot(px, py, arm)
+    reachable = calib.in_range(arm, px, py)
+    return arm, rx, ry, reachable
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 5. ゴミ箱自動検出（起動時に実行）
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def auto_detect_bins(cap, h_matrix):
+def auto_detect_bins(cap, calib):
     """
     カメラ映像から赤・黄・青のゴミ箱を色で自動検出し、
-    ロボット座標 (X, Y) を返す。
+    各アームから見たロボット座標 (X, Y) を返す。
 
     複数フレームの検出結果を平均化してノイズを低減する。
+    戻り値: {"赤の箱": {"pixel": [u, v], "arm1": {"x","y","in_range"}, "arm2": {...}}, ...}
     """
     print("\n[INFO] ゴミ箱を自動検出しています...")
     print("[INFO] 赤・黄・青のゴミ箱がカメラに映っていることを確認してください")
@@ -286,7 +397,7 @@ def auto_detect_bins(cap, h_matrix):
                 samples[bin_name].append(center)
         time.sleep(0.05)
 
-    # 各箱の中央値を計算 → ロボット座標に変換
+    # 各箱の中央値を計算 → 両アームのロボット座標に変換
     bin_coords = {}
     for bin_name, pts in samples.items():
         if len(pts) < NUM_SAMPLES // 2:
@@ -299,16 +410,15 @@ def auto_detect_bins(cap, h_matrix):
         px_median = int(np.median([p[0] for p in pts]))
         py_median = int(np.median([p[1] for p in pts]))
 
-        # ロボット座標に変換
-        rx, ry = pixel_to_robot_xy(px_median, py_median, h_matrix)
-        bin_coords[bin_name] = {
-            "x": round(rx, 2),
-            "y": round(ry, 2),
-            "z_drop": BIN_Z_DROP,
-            "z_safe": BIN_Z_SAFE,
-        }
-        print(f"[INFO] {bin_name}: X={rx:.1f}, Y={ry:.1f} mm "
-              f"(pixel: {px_median}, {py_median})")
+        entry = make_bin_entry((px_median, py_median), calib)
+        bin_coords[bin_name] = entry
+        a1, a2 = entry["arm1"], entry["arm2"]
+        print(f"[INFO] {bin_name} (pixel: {px_median}, {py_median}): "
+              f"アーム1=({a1['x']:.1f}, {a1['y']:.1f}) / アーム2=({a2['x']:.1f}, {a2['y']:.1f})")
+        for arm in ARMS:
+            if not entry[f"arm{arm}"]["in_range"]:
+                print(f"[WARN]   {bin_name} は {ARM_NAMES[arm]} の校正範囲外です。"
+                      "箱を中央 (中央の目印付近) に寄せることをおすすめします")
 
     return bin_coords
 
@@ -316,15 +426,15 @@ def auto_detect_bins(cap, h_matrix):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 6. 分別ピッキングシーケンス
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def execute_sorting(sock, target_info, bin_coords, h_matrix, table_z):
+def execute_sorting(sock, target_info, bin_coords, calib, arm_state):
     """
-    検出された物体を掴み、対応する箱へ運んで捨てる。
+    検出された物体を、担当アームで掴み、対応する箱へ運んで捨てる。
 
     sock        : duAroソケット
     target_info : WasteDetector.detect() の戻り値
-    bin_coords  : {"赤の箱": {"x":..., "y":..., "z_drop":..., "z_safe":...}, ...}
-    h_matrix    : ホモグラフィ行列
-    table_z     : 机のZ座標 (mm)
+    bin_coords  : {"赤の箱": {"pixel": [...], "arm1": {"x","y"}, "arm2": {"x","y"}}, ...}
+    calib       : camera.Calibration (アームごとのホモグラフィ・左右の境界)
+    arm_state   : {1: 待機位置にいるか, 2: 待機位置にいるか}
     """
     category = target_info["category"]
     box_name = CATEGORY_TO_BIN.get(category)
@@ -337,73 +447,99 @@ def execute_sorting(sock, target_info, bin_coords, h_matrix, table_z):
         print(f"[WARN] {box_name} の座標が取得できていません（未検出）")
         return False
 
-    bin_pos = bin_coords[box_name]
-
-    # 物体のピクセル座標 → ロボット座標
+    # 物体のピクセル座標 → 担当アーム・そのアームのロボット座標
     px, py = target_info["pixel"]
-    rx, ry = pixel_to_robot_xy(px, py, h_matrix)
-    z_approach = table_z + Z_APPROACH_OFFSET
-    z_grasp = table_z + Z_GRASP_OFFSET
+    arm, rx, ry, reachable = choose_arm(calib, px, py)
+    if REACH_CHECK and not reachable:
+        print(f"[WARN] 物体 (pixel: {px}, {py}) は {ARM_NAMES[arm]} の校正範囲外のためスキップします")
+        print("       キャリブレーションの目印の内側に物体を置いてください")
+        return False
+
+    bin_pos = bin_coords[box_name][f"arm{arm}"]
+    z = ARM_Z[arm]
+    transit, grasp_z, drop_z = z["transit"], z["grasp"], z["bin_drop"]
 
     print("\n" + "=" * 50)
-    print(f"【分別開始】 対象: {target_info['class']} ({category})")
-    print(f"  ・物体位置   : X={rx:.1f}, Y={ry:.1f}, Z={z_grasp:.1f} mm")
+    print(f"【分別開始】 対象: {target_info['class']} ({category})  担当: {ARM_NAMES[arm]}")
+    print(f"  ・物体位置   : X={rx:.1f}, Y={ry:.1f}, Z={grasp_z:.1f} mm (机面限界: {z['table_limit']}mm)")
+    print(f"  ・平面移動高 : Z={transit:.1f} mm (固定安全上空)")
     print(f"  ・搬送先     : {box_name} (X={bin_pos['x']:.1f}, Y={bin_pos['y']:.1f})")
     print("=" * 50)
 
+    # --- 0. もう片方のアームを待機位置へ (衝突防止) ---
+    if not ensure_other_arm_home(sock, arm, arm_state):
+        return False
+    arm_state[arm] = False   # これから動かすので「待機位置にいない」扱い
+
     # --- 1. ピック動作（掴む） ---
     # ① まずハンドを開く
-    gripper_control(sock, grasp=False)
+    gripper_control(sock, arm, grasp=False)
 
-    # ② 物体の上空へ移動（衝突防止）
-    print(">> [1/7] 物体上空へ移動")
-    if not move_to_xyz(sock, rx, ry, z_approach):
+    # ② 平面移動: 安全上空 Z=430mm で物体の真上へ移動
+    print(f">> [1/7] 物体上空へ平面移動 (安全高さ Z={transit:.1f})")
+    if not move_to_xyz(sock, arm, rx, ry, transit):
         return False
 
-    # ③ 掴む高さまで下降
-    print(">> [2/7] 下降")
-    if not move_to_xyz(sock, rx, ry, z_grasp):
+    # ③ 真下に下降して掴む高さへ
+    print(f">> [2/7] 垂直下降 (掴み位置 Z={grasp_z:.1f})")
+    if not move_to_xyz(sock, arm, rx, ry, grasp_z):
         return False
 
     # ④ チャックを閉じて掴む
     print(">> [3/7] 掴む")
-    gripper_control(sock, grasp=True)
+    gripper_control(sock, arm, grasp=True)
 
-    # ⑤ 上空へ持ち上げる
-    print(">> [4/7] 持ち上げ")
-    if not move_to_xyz(sock, rx, ry, z_approach):
+    # ⑤ 安全上空 Z=430mm へ真上に持ち上げる
+    print(f">> [4/7] 真上に持ち上げ (安全高さ Z={transit:.1f})")
+    if not move_to_xyz(sock, arm, rx, ry, transit):
         return False
 
     # --- 2. プレイス動作（箱へ捨てる） ---
-    # ⑥ 箱の上空安全高さへ運ぶ
-    print(f">> [5/7] {box_name}の上空へ移動")
-    if not move_to_xyz(sock, bin_pos["x"], bin_pos["y"], bin_pos["z_safe"]):
+    # ⑥ 平面移動: 安全上空 Z=430mm で箱の上空へ移動
+    print(f">> [5/7] {box_name}の上空へ平面移動 (安全高さ Z={transit:.1f})")
+    if not move_to_xyz(sock, arm, bin_pos["x"], bin_pos["y"], transit):
         return False
 
-    # ⑦ 箱の投下高さまで下げる
-    print(f">> [6/7] 投下高さへ下降")
-    if not move_to_xyz(sock, bin_pos["x"], bin_pos["y"], bin_pos["z_drop"]):
+    # ⑦ 投下高さへ下降
+    print(f">> [6/7] 投下高さへ下降 (Z={drop_z:.1f})")
+    if not move_to_xyz(sock, arm, bin_pos["x"], bin_pos["y"], drop_z):
         return False
 
     # ⑧ ハンドを開いてゴミを落とす
     print(f">> [7/7] 投下（{box_name}に捨てる）")
-    gripper_control(sock, grasp=False)
+    gripper_control(sock, arm, grasp=False)
 
-    # ⑨ 箱の上空安全高さへ退避
-    move_to_xyz(sock, bin_pos["x"], bin_pos["y"], bin_pos["z_safe"])
+    # ⑨ 安全上空 Z=430mm へ退避
+    print(f">> 退避上昇 (安全高さ Z={transit:.1f})")
+    move_to_xyz(sock, arm, bin_pos["x"], bin_pos["y"], transit)
 
-    # ⑩ 待機位置へ戻る
-    print(">> 待機位置へ復帰")
-    move_to_xyz(sock, HOME_POS["x"], HOME_POS["y"], HOME_POS["z"])
+    # ⑩ 待機位置へ平面移動 (Z=430)
+    print(f">> 待機位置へ復帰 (安全高さ Z={transit:.1f})")
+    go_home(sock, arm, arm_state)
 
     print("=== 分別完了 ===\n")
     return True
 
 
+def draw_target_guide(display_frame, target, calib, y_text):
+    """検出対象・担当アーム・ロボット座標を画面に表示する"""
+    cat = target["category"]
+    box_name = CATEGORY_TO_BIN.get(cat, "未設定")
+    px, py = target["pixel"]
+    arm, rx, ry, reachable = choose_arm(calib, px, py)
+    reach = "" if reachable else " 範囲外!"
+    color = (0, 255, 0) if reachable else (0, 0, 255)
+    guide = (
+        f"TARGET: {cat} -> [{box_name}] {ARM_NAMES[arm]} "
+        f"(conf:{target['conf']:.2f}, X={rx:.0f}, Y={ry:.0f}){reach}"
+    )
+    draw_text_jp(display_frame, guide, (20, y_text), font_size=18, color=color)
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 6.5. 全自動分別ループ
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def auto_sorting_loop(sock, cap, detector, bin_coords, h_matrix, table_z, window_name):
+def auto_sorting_loop(sock, cap, detector, bin_coords, calib, arm_state, window_name):
     """
     全自動分別ループ。
     ゴミを検出→分別→次のゴミを検出→分別… をゴミがなくなるまで繰り返す。
@@ -430,6 +566,7 @@ def auto_sorting_loop(sock, cap, detector, bin_coords, h_matrix, table_z, window
 
         # YOLO で物体検出
         target, display_frame = detector.detect(frame)
+        draw_split_line(display_frame, calib)
 
         # 画面にステータス表示
         status = f"AUTO MODE | Sorted: {sorted_count} | Scanning: {no_detect_count}/{AUTO_NO_DETECT_LIMIT}"
@@ -437,20 +574,17 @@ def auto_sorting_loop(sock, cap, detector, bin_coords, h_matrix, table_z, window
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
 
         if target:
-            cat = target["category"]
-            box_name = CATEGORY_TO_BIN.get(cat, "未設定")
-            draw_text_jp(display_frame, f"Next: {cat} -> [{box_name}]", (20, 65),
-                         font_size=18, color=(0, 255, 0))
+            draw_target_guide(display_frame, target, calib, 65)
         else:
             cv2.putText(display_frame, "Scanning for waste...", (20, 70),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128, 128, 128), 2)
 
         cv2.imshow(window_name, display_frame)
 
-        # 'q' キーで緊急停止
-        key = cv2.waitKey(1) & 0xFF
+        # 'q' キーで緊急停止 (ウィンドウ・ターミナル両方対応)
+        key = get_pressed_key(wait_ms=1)
         if key == ord("q"):
-            print("\n[INFO] 全自動モードを緊急停止しました")
+            print("\n[INFO] 'q' キーを検知: 全自動モードを緊急停止しました")
             break
 
         # --- 未検出の場合 ---
@@ -470,7 +604,7 @@ def auto_sorting_loop(sock, cap, detector, bin_coords, h_matrix, table_z, window
             break
 
         # 分別実行
-        success = execute_sorting(sock, target, bin_coords, h_matrix, table_z)
+        success = execute_sorting(sock, target, bin_coords, calib, arm_state)
 
         if success:
             sorted_count += 1
@@ -503,21 +637,28 @@ def auto_sorting_loop(sock, cap, detector, bin_coords, h_matrix, table_z, window
 if __name__ == "__main__":
     # --- A. キャリブレーション読み込み ---
     try:
-        H_matrix, table_z = load_calibration()
-        print(f"[INFO] キャリブレーション読み込み完了 (机Z={table_z:.1f} mm)")
-    except FileNotFoundError as e:
+        calib = load_calibration()
+        print(f"[INFO] キャリブレーション読み込み完了 "
+              f"(左右の境界 split_u={calib.split_u:.0f}px: 右->アーム1 / 左->アーム2)")
+        for arm in ARMS:
+            mz = calib.measured_z.get(f"arm{arm}")
+            if mz is not None:
+                print(f"[INFO]   {ARM_NAMES[arm]}: 校正時の先端Z={mz:.1f} mm / "
+                      f"掴む高さ={ARM_Z[arm]['grasp']:.1f} / 机面限界={ARM_Z[arm]['table_limit']:.1f}")
+    except (FileNotFoundError, ValueError, KeyError) as e:
         print(e)
-        print("[INFO] 先に camera.py の Mode 1 を実行してください")
+        print("[INFO] 先に camera.py の Mode 1 (双腕6点キャリブレーション) を実行してください")
         raise SystemExit(1)
 
-    # --- B. カメラ起動 ---
-    cap = cv2.VideoCapture(CAMERA_INDEX)
-    if not cap.isOpened():
-        print(f"[ERROR] カメラ(index={CAMERA_INDEX})を開けませんでした")
+    # --- B. カメラ起動 (WindowsではDSHOWを優先してMSMFエラー -1072873822 を防止) ---
+    try:
+        cap = open_camera(CAMERA_INDEX, warmup_frames=0)
+    except RuntimeError as e:
+        print(f"[ERROR] {e}")
         raise SystemExit(1)
 
     # --- C. ゴミ箱を自動検出 ---
-    bin_coords = auto_detect_bins(cap, H_matrix)
+    bin_coords = auto_detect_bins(cap, calib)
 
     if not bin_coords:
         print("[ERROR] ゴミ箱が1つも検出できませんでした")
@@ -552,8 +693,12 @@ if __name__ == "__main__":
         cap.release()
         raise SystemExit(1)
 
-    # --- E. モータON ---
-    motor_on(sock, arm=ARM)
+    # --- E. モータON (両アーム) ---
+    for arm in ARMS:
+        motor_on(sock, arm)
+
+    # 各アームが待機位置にいるか (起動直後は不明なので False。最初に動かす時に相手側を退避させる)
+    arm_state = {arm: False for arm in ARMS}
 
     # --- F. YOLO検出器の初期化 ---
     detector = WasteDetector()
@@ -563,9 +708,10 @@ if __name__ == "__main__":
     cv2.namedWindow(window_name)
 
     print("\n" + "=" * 50)
-    print("【duAro ゴミ自動分別システム】")
+    print("【duAro ゴミ自動分別システム (双腕)】")
     print("=" * 50)
     print(f"  検出済みゴミ箱: {', '.join(bin_coords.keys())}")
+    print("  担当: 画面の右側 -> アーム1(右腕) / 左側 -> アーム2(左腕)")
     print()
     print("  [操作方法]")
     print("  ・カメラの視野にゴミを置く")
@@ -575,10 +721,12 @@ if __name__ == "__main__":
     print("=" * 50 + "\n")
 
     # duAro側の前提プログラム確認メッセージ
-    print(f"[INFO] duAro側に以下のASプログラムが登録されている必要があります:")
-    print(f"       1) .PROGRAM {PROGRAM_NAME}()  / JMOVE {POSE_NAME}  / .END")
-    print(f"       2) .PROGRAM {PUMP_ON_PROGRAM}()   / OPENI 1   / .END")
-    print(f"       3) .PROGRAM {PUMP_OFF_PROGRAM}()  / CLOSEI 1  / .END\n")
+    print(f"[INFO] duAro側に以下のASプログラムが登録されている必要があります (両アームで実行):")
+    for arm in ARMS:
+        p = ARM_PROGRAMS[arm]
+        print(f"       {ARM_NAMES[arm]}: EXECUTE {arm}:{p['goto']} (JMOVE {p['pose']}) / "
+              f"{p['pump_on']} (OPENI) / {p['pump_off']} (CLOSEI)")
+    print()
 
     try:
         while True:
@@ -589,22 +737,11 @@ if __name__ == "__main__":
 
             # YOLO で物体検出・カテゴリ判定
             target, display_frame = detector.detect(frame)
+            draw_split_line(display_frame, calib)
 
-            # 画面上に案内を表示
+            # 画面上に案内を表示 (担当アーム・ロボット座標つき)
             if target:
-                cat = target["category"]
-                box_name = CATEGORY_TO_BIN.get(cat, "未設定")
-                conf = target["conf"]
-                px, py = target["pixel"]
-
-                # ロボット座標も画面に表示
-                rx, ry = pixel_to_robot_xy(px, py, H_matrix)
-                guide = (
-                    f"TARGET: {cat} -> [{box_name}] "
-                    f"(conf:{conf:.2f}, X={rx:.0f}, Y={ry:.0f})"
-                )
-                draw_text_jp(display_frame, guide, (20, 20),
-                             font_size=18, color=(0, 255, 0))
+                draw_target_guide(display_frame, target, calib, 20)
                 cv2.putText(display_frame, "'s': Sort 1 / 'a': Auto-sort all", (20, 70),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
             else:
@@ -612,14 +749,16 @@ if __name__ == "__main__":
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128, 128, 128), 2)
 
             cv2.imshow(window_name, display_frame)
-            key = cv2.waitKey(20) & 0xFF
+            key = get_pressed_key(wait_ms=20)
 
-            if key in (ord("q"), ord("Q"), 27):
+            if key == ord("q"):
+                print("[INFO] 'q' キーを検知: プログラムを終了します")
                 break
 
-            elif key in (ord("s"), ord("S")):
+            elif key == ord("s"):
+                print("[INFO] 's' キーを検知しました (手動1個分別)")
                 if target is None:
-                    print("[WARN] 分別対象の物体が検出されていません")
+                    print("[WARN] カメラの視野内にゴミが検出されていません！カメラの前にゴミを置いてください")
                     continue
 
                 # 分別先の箱が検出済みか確認
@@ -629,10 +768,11 @@ if __name__ == "__main__":
                     print(f"[WARN] {needed_bin} が検出されていないため分別できません")
                     continue
 
-                execute_sorting(sock, target, bin_coords, H_matrix, table_z)
+                execute_sorting(sock, target, bin_coords, calib, arm_state)
 
-            elif key in (ord("a"), ord("A")):
-                auto_sorting_loop(sock, cap, detector, bin_coords, H_matrix, table_z, window_name)
+            elif key == ord("a"):
+                print("[INFO] 'a' キーを検知しました (全自動分別開始)")
+                auto_sorting_loop(sock, cap, detector, bin_coords, calib, arm_state, window_name)
 
     except KeyboardInterrupt:
         print("\n[INFO] Ctrl+C で中断されました")
