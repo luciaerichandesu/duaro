@@ -77,6 +77,7 @@ from camera import (
     draw_text_jp,
     draw_split_line,
     open_camera,
+    parse_where,
     ARM_RIGHT,
     ARM_LEFT,
     ARM_NAMES,
@@ -122,26 +123,26 @@ ARM_Z = {
         "table_limit": 294.0,   # 机の表面限界 (mm) ※これより下(小さい数値)には下げない
         "transit": 430.0,       # ものを持って移動・上空移動する時の固定Z座標 (mm)
         "grasp": 298.0,         # 物体を掴む高さ (mm) ※机面294mmより4mm手前の安全位置
-        "bin_drop": 430.0,      # 投下高さ (430mm固定: 箱にも絶対にぶつからない安全投下)
+        "bin_drop": 350.0,      # 箱の真上でゴミを離す高さ (mm) ※430mmから垂直に下げて優しく投下
     },
     ARM_LEFT: {
         "table_limit": 294.0,
         "transit": 430.0,
         "grasp": 298.0,
-        "bin_drop": 430.0,
+        "bin_drop": 350.0,
     },
 }
 
 # 待機・ホーム位置 (安全上空 430mm / アームごと)
-# ※ アーム2は座標系が鏡像 (同じ姿勢で X の符号が逆) のため X を反転している。
-#    初回は低速で動かして、待機位置が適切か必ず確認すること。
+# ※ 起動時に WHERE コマンドで実際のアーム初期位置 (X, Y) を自動取得して上書きする。
+#    下は万一 WHERE 取得に失敗したときのフォールバック値 (稼働エリア内の左右端)。
 HOME_POS = {
-    ARM_RIGHT: {"x": 250.0, "y": 0.0, "z": 430.0},
-    ARM_LEFT:  {"x": -250.0, "y": 0.0, "z": 430.0},
+    ARM_RIGHT: {"x": 280.0, "y": 320.0, "z": 430.0},
+    ARM_LEFT:  {"x": -280.0, "y": 320.0, "z": 430.0},
 }
 
-# 校正した範囲の外にある物体はスキップする (ホモグラフィの外挿は誤差が大きく危険なため)
-REACH_CHECK = True
+# 校正した範囲の外にある物体をスキップするか (Falseなら警告のみ出して動作自体は実行する)
+REACH_CHECK = False
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 全自動モードの設定
@@ -224,16 +225,57 @@ def send_cmd(sock, command, wait=0.3):
 
 _ERROR_PATTERN = re.compile(r"(\([EP]\d{4}\)|ホールド|途中停止|動作範囲外|ABORT)")
 
+# アーム動作中もカメラ映像をリアルタイム更新するためのプレビューコンテキスト
+_PREVIEW_CTX = {"cap": None, "window_name": None, "calib": None, "status_text": ""}
 
-def wait_for_completion(sock, max_wait=30):
+
+def set_preview_context(cap=None, window_name=None, calib=None):
+    """アーム動作中にカメラ映像を更新するための情報を登録する"""
+    _PREVIEW_CTX["cap"] = cap
+    _PREVIEW_CTX["window_name"] = window_name
+    _PREVIEW_CTX["calib"] = calib
+
+
+def pump_camera_preview(status_text=None):
     """
-    duAroが完了メッセージを返すまで待つ。
-    エラーを検知した場合は即座に False を返す。
+    アーム動作待ちの間にカメラから最新フレームを読み取り、画面を更新する（案A）。
+    重いYOLO推論は行わないため動作が重くならず、カメラバッファに古い画像が溜まるのも防ぐ。
+    """
+    cap = _PREVIEW_CTX.get("cap")
+    win = _PREVIEW_CTX.get("window_name")
+    calib = _PREVIEW_CTX.get("calib")
+    if cap is None or win is None:
+        return
+    if status_text is not None:
+        _PREVIEW_CTX["status_text"] = status_text
+    ret, frame = cap.read()
+    if not ret:
+        return
+    if calib is not None:
+        draw_split_line(frame, calib)
+    msg = _PREVIEW_CTX.get("status_text") or "ARM MOVING..."
+    draw_text_jp(frame, f"【動作中】 {msg}", (20, 25), font_size=18, color=(0, 165, 255))
+    cv2.imshow(win, frame)
+    cv2.waitKey(1)
+
+
+def reset_error_and_motor_on(sock, arm):
+    """異常停止時にエラーリセット(ERESET)とモータ再ONを行って次ターンが詰まるのを防ぐ"""
+    print(f"[INFO] エラー復旧: ERESET -> ZPOWER {arm}: ON を実行します")
+    send_cmd(sock, "ERESET", wait=0.8)
+    send_cmd(sock, f"ZPOWER {arm}: ON", wait=1.0)
+
+
+def wait_for_completion(sock, arm=None, max_wait=30):
+    """
+    duAroが完了メッセージを返すまで待つ（待機中もカメラ映像をリアルタイム更新）。
+    エラーを検知した場合は自動でエラーリセットを行い False を返す。
     """
     start = time.time()
     full_resp = ""
-    sock.settimeout(0.5)
+    sock.settimeout(0.05)
     while time.time() - start < max_wait:
+        pump_camera_preview()
         try:
             chunk = sock.recv(2048).decode("shift_jis", errors="ignore")
             if not chunk:
@@ -244,6 +286,8 @@ def wait_for_completion(sock, max_wait=30):
                 return True
             if _ERROR_PATTERN.search(full_resp):
                 print(f"[ERROR] ロボット異常停止:\n{full_resp.strip()}")
+                if arm is not None:
+                    reset_error_and_motor_on(sock, arm)
                 return False
         except socket.timeout:
             continue
@@ -251,6 +295,8 @@ def wait_for_completion(sock, max_wait=30):
             print(f"[ERROR] 受信エラー: {e}")
             return False
     print(f"[WARN] {max_wait}秒以内に完了メッセージを検知できませんでした")
+    if arm is not None:
+        reset_error_and_motor_on(sock, arm)
     return False
 
 
@@ -260,6 +306,28 @@ def motor_on(sock, arm):
     resp = send_cmd(sock, f"ZPOWER {arm}: ON", wait=1.0)
     print(f"[RECV] {resp.strip()}")
     return resp
+
+
+def record_initial_home_positions(sock):
+    """
+    起動時の各アームの現在位置 (X, Y) を WHERE コマンドで取得し、
+    初期位置 (HOME_POS) として記録する。
+    これにより、動作範囲外の仮座標へ移動して異常停止するのを防ぐ。
+    """
+    print("\n[INFO] 起動時のアーム位置を初期位置(HOME_POS)として取得しています...")
+    for arm in ARMS:
+        try:
+            text = send_cmd(sock, f"WHERE {arm}:", wait=0.5)
+            send_cmd(sock, "", wait=0.1)  # 連続表示モード解除用の空Enter
+            x, y, z, _o, _a, _t = parse_where(text)
+            transit_z = ARM_Z[arm]["transit"]
+            HOME_POS[arm] = {"x": round(x, 2), "y": round(y, 2), "z": transit_z}
+            print(f"[INFO]   {ARM_NAMES[arm]} 初期位置を登録: "
+                  f"X={x:.1f}, Y={y:.1f}, Z={transit_z:.1f} (現在Z={z:.1f})")
+        except Exception as e:
+            fb = HOME_POS[arm]
+            print(f"[WARN]   {ARM_NAMES[arm]} の現在位置取得に失敗 ({e}) -> "
+                  f"フォールバック値 (X={fb['x']:.1f}, Y={fb['y']:.1f}, Z={fb['z']:.1f}) を使用します")
 
 
 def set_point(sock, arm, x, y, z, o=0.0, a=0.0, t=0.0):
@@ -277,7 +345,8 @@ def set_point(sock, arm, x, y, z, o=0.0, a=0.0, t=0.0):
     # 「変更？」が届くまで最大3秒待つ
     deadline = time.time() + 3.0
     while "変更" not in resp1 and time.time() < deadline:
-        time.sleep(0.2)
+        pump_camera_preview()
+        time.sleep(0.1)
         sock.settimeout(0.2)
         try:
             chunk = sock.recv(4096).decode("shift_jis", errors="ignore")
@@ -300,7 +369,9 @@ def move_to_xyz(sock, arm, x, y, z):
         print(f"[SAFETY GUARD] 指令Z={z:.1f} は机面({limit}mm)より下のため、安全限界 Z={limit:.1f} に自動制限しました！")
         z = limit
 
-    print(f"[INFO] {ARM_NAMES[arm]} 移動: X={x:.1f}, Y={y:.1f}, Z={z:.1f}")
+    msg = f"{ARM_NAMES[arm]} 移動: X={x:.1f}, Y={y:.1f}, Z={z:.1f}"
+    print(f"[INFO] {msg}")
+    pump_camera_preview(msg)
     set_point(sock, arm, x, y, z)
 
     # EXECUTE でプログラム実行
@@ -313,20 +384,25 @@ def move_to_xyz(sock, arm, x, y, z):
         print(f"[ERROR] EXECUTE 送信エラー: {e}")
         return False
 
-    return wait_for_completion(sock)
+    return wait_for_completion(sock, arm=arm)
 
 
 def gripper_control(sock, arm, grasp=True):
     """ハンドの開閉（空気ポンプ: pump_on / pump_off）"""
     progs = ARM_PROGRAMS[arm]
     if grasp:
-        print(f"[INFO] {ARM_NAMES[arm]} ハンド閉じる(掴む): {progs['pump_on']}")
+        msg = f"{ARM_NAMES[arm]} ハンド閉じる(掴む): {progs['pump_on']}"
+        print(f"[INFO] {msg}")
+        pump_camera_preview(msg)
         success, _ = pump_on(sock, arm=arm, program_name=progs["pump_on"])
     else:
-        print(f"[INFO] {ARM_NAMES[arm]} ハンド開く(離す): {progs['pump_off']}")
+        msg = f"{ARM_NAMES[arm]} ハンド開く(離す): {progs['pump_off']}"
+        print(f"[INFO] {msg}")
+        pump_camera_preview(msg)
         success, _ = pump_off(sock, arm=arm, program_name=progs["pump_off"])
     if not success:
         print("[WARN] ハンド開閉コマンドの完了確認に失敗しました")
+        reset_error_and_motor_on(sock, arm)
     return success
 
 
@@ -334,12 +410,19 @@ def gripper_control(sock, arm, grasp=True):
 # 4.5. 双腕の待機管理 (動かすアームは常に1本だけ)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def go_home(sock, arm, arm_state):
-    """アームを待機位置 (安全上空 Z=430) へ移動する"""
+    """アームを初期位置 (安全上空 Z=430) へ移動する"""
     home = HOME_POS[arm]
-    print(f">> {ARM_NAMES[arm]} を待機位置へ (Z={home['z']:.1f})")
+    print(f">> {ARM_NAMES[arm]} を初期位置へ復帰 (X={home['x']:.1f}, Y={home['y']:.1f}, Z={home['z']:.1f})")
     ok = move_to_xyz(sock, arm, home["x"], home["y"], home["z"])
     arm_state[arm] = ok
     return ok
+
+
+def return_all_arms_home(sock, arm_state):
+    """初期位置に戻っていないアームをすべて初期位置へ戻す"""
+    for arm in ARMS:
+        if not arm_state.get(arm, False):
+            go_home(sock, arm, arm_state)
 
 
 def ensure_other_arm_home(sock, arm, arm_state):
@@ -450,10 +533,13 @@ def execute_sorting(sock, target_info, bin_coords, calib, arm_state):
     # 物体のピクセル座標 → 担当アーム・そのアームのロボット座標
     px, py = target_info["pixel"]
     arm, rx, ry, reachable = choose_arm(calib, px, py)
-    if REACH_CHECK and not reachable:
-        print(f"[WARN] 物体 (pixel: {px}, {py}) は {ARM_NAMES[arm]} の校正範囲外のためスキップします")
-        print("       キャリブレーションの目印の内側に物体を置いてください")
-        return False
+    if not reachable:
+        if REACH_CHECK:
+            print(f"[WARN] 物体 (pixel: {px}, {py}) は {ARM_NAMES[arm]} の校正範囲外のためスキップします")
+            print("       キャリブレーションの目印の内側に物体を置いてください")
+            return False
+        else:
+            print(f"[WARN] 物体 (pixel: {px}, {py}) は {ARM_NAMES[arm]} の校正範囲より少し外側ですが、そのまま実行します")
 
     bin_pos = bin_coords[box_name][f"arm{arm}"]
     z = ARM_Z[arm]
@@ -500,22 +586,29 @@ def execute_sorting(sock, target_info, bin_coords, calib, arm_state):
     if not move_to_xyz(sock, arm, bin_pos["x"], bin_pos["y"], transit):
         return False
 
-    # ⑦ 投下高さへ下降
-    print(f">> [6/7] 投下高さへ下降 (Z={drop_z:.1f})")
-    if not move_to_xyz(sock, arm, bin_pos["x"], bin_pos["y"], drop_z):
-        return False
+    # ⑦ 箱の真上で投下高さへ垂直下降 (drop_z が transit と異なる場合のみ)
+    if abs(drop_z - transit) > 0.5:
+        print(f">> [6/7] 投下高さへ垂直下降 (Z={drop_z:.1f})")
+        if not move_to_xyz(sock, arm, bin_pos["x"], bin_pos["y"], drop_z):
+            go_home(sock, arm, arm_state)
+            return False
 
     # ⑧ ハンドを開いてゴミを落とす
     print(f">> [7/7] 投下（{box_name}に捨てる）")
     gripper_control(sock, arm, grasp=False)
 
-    # ⑨ 安全上空 Z=430mm へ退避
-    print(f">> 退避上昇 (安全高さ Z={transit:.1f})")
-    move_to_xyz(sock, arm, bin_pos["x"], bin_pos["y"], transit)
+    # ⑨ 安全上空 Z=430mm へ垂直上昇 (drop_z から持ち上げてから横移動する)
+    if abs(drop_z - transit) > 0.5:
+        print(f">> 退避上昇 (安全高さ Z={transit:.1f})")
+        if not move_to_xyz(sock, arm, bin_pos["x"], bin_pos["y"], transit):
+            go_home(sock, arm, arm_state)
+            return False
 
-    # ⑩ 待機位置へ平面移動 (Z=430)
-    print(f">> 待機位置へ復帰 (安全高さ Z={transit:.1f})")
-    go_home(sock, arm, arm_state)
+    # ⑩ 初期位置へ平面移動 (Z=430)
+    print(f">> 初期位置へ復帰 (安全高さ Z={transit:.1f})")
+    if not go_home(sock, arm, arm_state):
+        print("[WARN] 初期位置への復帰に失敗しました")
+        return False
 
     print("=== 分別完了 ===\n")
     return True
@@ -624,8 +717,11 @@ def auto_sorting_loop(sock, cap, detector, bin_coords, calib, arm_state, window_
         # while条件で正常終了 = 連続未検出で全完了
         print(f"\n[INFO] {AUTO_NO_DETECT_LIMIT}回連続で未検出 → ゴミがなくなりました")
 
+    # 全完了時に初期位置へ戻っていないアームがあれば初期位置へ戻す
+    return_all_arms_home(sock, arm_state)
+
     print("\n" + "=" * 50)
-    print(f"【全自動分別完了】 合計 {sorted_count} 個のゴミを分別しました")
+    print(f"【全自動分別完了】 合計 {sorted_count} 個のゴミを分別しました（初期位置復帰済み）")
     print("=" * 50 + "\n")
 
     return sorted_count
@@ -638,8 +734,11 @@ if __name__ == "__main__":
     # --- A. キャリブレーション読み込み ---
     try:
         calib = load_calibration()
+        left_arm = calib.arm_for_pixel(calib.split_u - 1)
+        right_arm = calib.arm_for_pixel(calib.split_u + 1)
         print(f"[INFO] キャリブレーション読み込み完了 "
-              f"(左右の境界 split_u={calib.split_u:.0f}px: 右->アーム1 / 左->アーム2)")
+              f"(左右の境界 split_u={calib.split_u:.0f}px: "
+              f"画面左->{ARM_NAMES[left_arm]} / 画面右->{ARM_NAMES[right_arm]})")
         for arm in ARMS:
             mz = calib.measured_z.get(f"arm{arm}")
             if mz is not None:
@@ -693,12 +792,13 @@ if __name__ == "__main__":
         cap.release()
         raise SystemExit(1)
 
-    # --- E. モータON (両アーム) ---
+    # --- E. モータON (両アーム) & 起動時の初期位置(HOME_POS)を自動取得 ---
     for arm in ARMS:
         motor_on(sock, arm)
+    record_initial_home_positions(sock)
 
-    # 各アームが待機位置にいるか (起動直後は不明なので False。最初に動かす時に相手側を退避させる)
-    arm_state = {arm: False for arm in ARMS}
+    # 各アームが待機位置にいるか (起動時は初期位置にいるので True)
+    arm_state = {arm: True for arm in ARMS}
 
     # --- F. YOLO検出器の初期化 ---
     detector = WasteDetector()
@@ -706,12 +806,13 @@ if __name__ == "__main__":
     # --- G. メインループ ---
     window_name = "duAro Waste Sorting [s: Sort, a: Auto, q: Quit]"
     cv2.namedWindow(window_name)
+    set_preview_context(cap=cap, window_name=window_name, calib=calib)
 
     print("\n" + "=" * 50)
     print("【duAro ゴミ自動分別システム (双腕)】")
     print("=" * 50)
     print(f"  検出済みゴミ箱: {', '.join(bin_coords.keys())}")
-    print("  担当: 画面の右側 -> アーム1(右腕) / 左側 -> アーム2(左腕)")
+    print(f"  担当: 画面左側 -> {ARM_NAMES[left_arm]} / 画面右側 -> {ARM_NAMES[right_arm]}")
     print()
     print("  [操作方法]")
     print("  ・カメラの視野にゴミを置く")

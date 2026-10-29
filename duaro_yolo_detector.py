@@ -8,9 +8,20 @@ duaro_yolo_detector.py (ファイル1.5: ゴミ分別対応 YOLO26 物体検出�
     python duaro_yolo_detector.py
 """
 
+import os
+
 import cv2
 import numpy as np
 from ultralytics import YOLO
+
+# 日本語テキスト描画
+try:
+    from camera import draw_text_jp
+except ImportError:
+    def draw_text_jp(img, text, pos, font_size=18, color=(0, 255, 0)):
+        cv2.putText(img, text, (pos[0], pos[1] + font_size),
+                    cv2.FONT_HERSHEY_SIMPLEX, font_size / 30.0, color, 2)
+        return img
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 1. 分別設定（マッピングと色）
@@ -47,10 +58,22 @@ CATEGORY_COLORS = {
 # 2. 検出＆分別クラス
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 class WasteDetector:
-    def __init__(self, model_path="yolo26x.pt", conf_thresh=0.25):
+    def __init__(self, model_path="yolo26x.pt", conf_thresh=0.15):
+        # ローカルにファイルがない場合、近傍フォルダも探索
+        if not os.path.exists(model_path):
+            candidates = [
+                os.path.join(os.path.dirname(__file__), model_path),
+                os.path.join(os.path.dirname(__file__), "..", model_path),
+                os.path.join(os.path.dirname(__file__), "yolo26x.pt"),
+            ]
+            for c in candidates:
+                if os.path.exists(c):
+                    model_path = c
+                    break
+
         print(f"[INFO] YOLO26モデルをロード中: {model_path}")
-        self.model = YOLO(model_path)#モデルにYOLOを準備
-        self.conf_thresh = conf_thresh#閾値を後でも使えるように保存する
+        self.model = YOLO(model_path)  # モデルにYOLOを準備
+        self.conf_thresh = conf_thresh  # 閾値を後でも使えるように保存する
 
     def detect(self, frame):#frame、カメラ画像を受け取る
         """
@@ -117,9 +140,9 @@ class WasteDetector:
 
             # ラベル表示
             label_text = f"[{category}] {cls_name} ({conf:.2f})"#画面上にそれぞれ分類、クラス名、自信度を表示する
-            cv2.putText(
-                display_frame, label_text, (x1, max(y1 - 8, 20)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2
+            draw_text_jp(
+                display_frame, label_text, (x1, max(y1 - 22, 5)),
+                font_size=16, color=box_color
             )
 
         # 1位に選ばれたターゲットの中心に目印を描画
@@ -132,9 +155,9 @@ class WasteDetector:
             cv2.circle(display_frame, (tcx, tcy), 6, color, -1)#6は〇の半径、-1で塗りつぶす
 
             #丸のすぐ右斜め上に大きい文字でTARGETとかく
-            cv2.putText(
-                display_frame, f"TARGET -> {cat}", (tcx + 8, tcy - 8),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2
+            draw_text_jp(
+                display_frame, f"TARGET -> {cat}", (tcx + 8, max(tcy - 20, 5)),
+                font_size=18, color=color
             )
 
         return best_target, display_frame
@@ -167,9 +190,9 @@ if __name__ == "__main__":
             cx, cy = target["pixel"]
             conf = target["conf"]
             #写真の上に枠線や文字を書きこむ
-            cv2.putText(
+            draw_text_jp(
                 view, f"Detected: {cat} ({cx}, {cy}) conf:{conf:.2f}",
-                (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2
+                (20, 20), font_size=20, color=(0, 255, 0)
             )
         #書き終わったものをpcの画面上にだす
         cv2.imshow("Waste Sorting Detector Test", view)
