@@ -53,6 +53,23 @@ CATEGORY_COLORS = {
     CATEGORY_CAN_BOTTLE: (0, 0, 255),    # 缶・ビンは赤色
 }
 
+# ゴミ箱の中心からこの半径(ピクセル)以内にある物体は「すでに箱の中にある」とみなして無視する
+BIN_IGNORE_RADIUS_PX = 60
+
+
+def _is_inside_any_bin(cx, cy, bin_coords, radius=BIN_IGNORE_RADIUS_PX):
+    """(cx, cy) が登録済みゴミ箱の中心から radius ピクセル以内にあるか判定する"""
+    if not bin_coords:
+        return False
+    r2 = radius * radius
+    for binfo in bin_coords.values():
+        if not isinstance(binfo, dict) or "pixel" not in binfo:
+            continue
+        bx, by = binfo["pixel"][0], binfo["pixel"][1]
+        if (cx - bx) ** 2 + (cy - by) ** 2 <= r2:
+            return True
+    return False
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 2. 検出＆分別クラス
@@ -75,9 +92,10 @@ class WasteDetector:
         self.model = YOLO(model_path)  # モデルにYOLOを準備
         self.conf_thresh = conf_thresh  # 閾値を後でも使えるように保存する
 
-    def detect(self, frame):#frame、カメラ画像を受け取る
+    def detect(self, frame, bin_coords=None, bin_ignore_radius=BIN_IGNORE_RADIUS_PX):#frame、カメラ画像を受け取る
         """
         カメラ映像から物体を検出し、ゴミの分別カテゴリと中心座標を返す。
+        bin_coords が渡された場合、ゴミ箱の中(中心から bin_ignore_radius px以内)にある物体は無視する。
 
         戻り値:
             best_target: {
@@ -122,6 +140,10 @@ class WasteDetector:
             # 物体の中心座標 (cx, cy)　真ん中を狙うので足して2でわる
             cx = (x1 + x2) // 2
             cy = (y1 + y2) // 2
+
+            # ゴミ箱の中に入っている物体（またはゴミ箱自体の誤検出）はゴミとして認識しない
+            if _is_inside_any_bin(cx, cy, bin_coords, radius=bin_ignore_radius):
+                continue
 
             # 最も信頼度が高いものをターゲットにする
             if conf > highest_conf:
